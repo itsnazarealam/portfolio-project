@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fruit Slicer - Hand Gesture Game</title>
+    <!-- Tailwind CSS for sleek UI styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- MediaPipe Hands & Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap');
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            overflow: hidden;
+            touch-action: none;
+        }
+        .retro-shadow {
+            text-shadow: 3px 3px 0px #000, -1px -1px 0px #000, 1px -1px 0px #000, -1px 1px 0px #000, 1px 1px 0px #000;
+        }
+    </style>
+</head>
+<body class="h-screen w-screen flex flex-col items-center justify-center relative select-none">
+
+    <!-- Loading / Start Overlay -->
+    <div id="overlay" class="absolute inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
+        <div class="max-w-md w-full bg-slate-900 border-2 border-amber-500/50 rounded-3xl p-8 shadow-2xl shadow-amber-500/10">
+            <h1 class="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-amber-400 to-rose-500 mb-4 retro-shadow">
+                FRUIT NINJA JS
+            </h1>
+            <p class="text-slate-300 text-sm mb-6 leading-relaxed">
+                Slice floating fruits using your webcam hand gestures! Point with your index finger to cut fruits. Avoid bombs!
+            </p>
+            
+            <div id="loading-status" class="text-amber-400 font-semibold mb-6 animate-pulse">
+                Initializing AI Hand Tracking...
+            </div>
+
+            <div class="flex flex-col sm:flex-row gap-4 w-full">
+                <button id="start-btn" disabled class="flex-1 py-4 px-6 rounded-2xl bg-gradient-to-r from-amber-500 to-rose-500 text-white font-bold text-lg opacity-50 cursor-not-allowed transition transform active:scale-95 shadow-lg shadow-rose-500/30">
+                    START GAME
+                </button>
+                <button id="fallback-btn" class="hidden flex-1 py-4 px-6 rounded-2xl bg-slate-800 border-2 border-slate-600 text-white font-bold text-sm transition transform active:scale-95 shadow-lg hover:bg-slate-700">
+                    PLAY WITH MOUSE
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- HUD Header -->
+    <div class="absolute top-4 left-6 right-6 z-20 flex justify-between items-center pointer-events-none">
+        <div class="bg-slate-900/80 backdrop-blur border border-slate-700/50 rounded-2xl px-6 py-3 flex items-center gap-4 shadow-xl">
+            <div>
+                <div class="text-xs text-slate-400 uppercase font-bold tracking-wider">Score</div>
+                <div id="score-val" class="text-3xl font-extrabold text-amber-400 retro-shadow">0</div>
+            </div>
+            <div class="h-8 w-px bg-slate-700"></div>
+            <div>
+                <div class="text-xs text-slate-400 uppercase font-bold tracking-wider">Lives</div>
+                <div id="lives-val" class="text-3xl font-extrabold text-rose-500 retro-shadow">❤️ ❤️ ❤️</div>
+            </div>
+        </div>
+
+        <div id="combo-display" class="text-2xl font-black text-rose-400 retro-shadow opacity-0 transition-opacity duration-300">
+            COMBO! +20
+        </div>
+    </div>
+
+    <!-- Game Viewport Container -->
+    <div class="relative w-full h-full flex items-center justify-center bg-slate-950 overflow-hidden">
+        <!-- Dimmed Video Background -->
+        <video id="webcam" class="absolute inset-0 w-full h-full object-cover transform -scale-x-100 opacity-40 pointer-events-none" playsinline autoplay muted></video>
+        <!-- Canvas Layer for Graphics & Fruits -->
+        <canvas id="gameCanvas" class="absolute inset-0 w-full h-full object-cover transform -scale-x-100 touch-none"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const videoElement = document.getElementById('webcam');
+        const overlay = document.getElementById('overlay');
+        const startBtn = document.getElementById('start-btn');
+        const loadingStatus = document.getElementById('loading-status');
+        const scoreVal = document.getElementById('score-val');
+        const livesVal = document.getElementById('lives-val');
+        const comboDisplay = document.getElementById('combo-display');
+        const fallbackBtn = document.getElementById('fallback-btn');
+
+        let width, height;
+        let useMouseFallback = false;
+
+        function resizeCanvas() {
+            if (useMouseFallback || !videoElement.videoWidth) {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            } else {
+                canvas.width = videoElement.videoWidth;
+                canvas.height = videoElement.videoHeight;
+            }
+            width = canvas.width;
+            height = canvas.height;
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        // Helper to find visible area when using object-fit: cover
+        function getVisibleBounds() {
+            const rect = canvas.getBoundingClientRect();
+            if (rect.width === 0) return { minX: 0, maxX: width, minY: 0, maxY: height };
+            
+            const scale = Math.max(rect.width / width, rect.height / height);
+            const displayedWidth = width * scale;
+            const displayedHeight = height * scale;
+            
+            const cropX = (displayedWidth - rect.width) / 2 / scale;
+            const cropY = (displayedHeight - rect.height) / 2 / scale;
+            
+            return {
+                minX: cropX,
+                maxX: width - cropX,
+                minY: cropY,
+                maxY: height - cropY
+            };
+        }
+
+        // Game State Variables
+        let gameState = 'LOADING'; // LOADING, START, PLAYING, GAMEOVER
+        let score = 0;
+        let lives = 3;
+        let fruits = [];
+        let particles = [];
+        let bladeTrail = [];
+        const MAX_TRAIL_LENGTH = 12;
+        let fingerPos = null;
+        let lastFingerPos = null;
+        let spawnTimer = 0;
+        let swordAngle = 0;
+
+        // Fruit Definitions
+        const FRUIT_TYPES = [
+            { name: '🍉', color: '#ef4444', radius: 45, points: 10 },
+            { name: '🍊', color: '#f97316', radius: 38, points: 15 },
+            { name: '🍎', color: '#dc2626', radius: 40, points: 10 },
+            { name: '🍌', color: '#eab308', radius: 35, points: 20 },
+            { name: '🍇', color: '#a855f7', radius: 35, points: 15 },
+            { name: '💣', color: '#1e293b', radius: 40, isBomb: true }
+        ];
+
+        class FruitObject {
+            constructor() {
+                this.type = FRUIT_TYPES[Math.floor(Math.random() * FRUIT_TYPES.length)];
+                const bounds = getVisibleBounds();
+                
+                // Spawn within visible X bounds
+                const spawnRange = (bounds.maxX - 60) - (bounds.minX + 60);
+                this.x = Math.random() * spawnRange + (bounds.minX + 60);
+                this.y = bounds.maxY + 80;
+                
+                this.vx = (Math.random() - 0.5) * 8; // Slower horizontal drift
+                this.vy = -(Math.random() * 5 + 15); // Gentler upward blast
+                this.radius = this.type.radius;
+                this.sliced = false;
+                this.rotation = 0;
+                this.rotSpeed = (Math.random() - 0.5) * 0.10; // Slower rotation
+            }
+
+            update() {
+                this.vy += 0.22; // Much lower gravity for "floaty" hang time
+                this.x += this.vx;
+                this.y += this.vy;
+                this.rotation += this.rotSpeed;
+            }
+
+            draw() {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.rotation);
+                
+                if (this.type.isBomb) {
+                    ctx.beginPath();
+                    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+                    ctx.fillStyle = '#0f172a';
+                    ctx.fill();
+                    ctx.lineWidth = 4;
+                    ctx.strokeStyle = '#ef4444';
+                    ctx.stroke();
+                }
+                
+                ctx.font = `${this.radius * 1.6}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(this.type.name, 0, 0);
+                
+                ctx.restore();
+            }
+        }
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                this.size = Math.random() * 8 + 4;
+                this.vx = (Math.random() - 0.5) * 14;
+                this.vy = (Math.random() - 0.5) * 14;
+                this.alpha = 1.0;
+            }
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.alpha -= 0.03;
+            }
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, this.alpha);
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        let aiReady = false;
+        hands.onResults((results) => {
+            if (!aiReady) {
+                aiReady = true;
+                loadingStatus.innerText = "Camera & AI Ready! Start Slicing!";
+                loadingStatus.classList.remove('animate-pulse');
+                startBtn.disabled = false;
+                startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                const indexTip = landmarks[8];
+                
+                // Canvas and Video are BOTH mirrored via CSS. 
+                // So mapping directly maps visual to logical flawlessly.
+                const cx = indexTip.x * width; 
+                const cy = indexTip.y * height;
+                
+                lastFingerPos = fingerPos;
+                fingerPos = { x: cx, y: cy };
+
+                bladeTrail.push(fingerPos);
+                if (bladeTrail.length > MAX_TRAIL_LENGTH) {
+                    bladeTrail.shift();
+                }
+            } else {
+                fingerPos = null;
+                lastFingerPos = null;
+                if (bladeTrail.length > 0) bladeTrail.shift();
+            }
+        });
+
+        let lastVideoTime = -1;
+        let isDetecting = false;
+
+        async function detectionFrame() {
+            if (!isDetecting && videoElement.readyState >= 2 && videoElement.currentTime !== lastVideoTime) {
+                isDetecting = true;
+                lastVideoTime = videoElement.currentTime;
+                await hands.send({ image: videoElement });
+                isDetecting = false;
+            }
+            requestAnimationFrame(detectionFrame);
+        }
+
+        async function initSystem() {
+            try {
+                loadingStatus.innerText = "Loading AI Core...";
+                await hands.initialize();
+                
+                loadingStatus.innerText = "Requesting Camera Access...";
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
+                });
+                
+                videoElement.srcObject = stream;
+                videoElement.onloadedmetadata = () => {
+                    videoElement.play();
+                    resizeCanvas();
+                    loadingStatus.innerText = "Warming up AI Model...";
+                    detectionFrame();
+                };
+            } catch (err) {
+                console.error("Camera Error:", err);
+                loadingStatus.innerHTML = "Camera blocked or unavailable.<br><span class='text-sm text-slate-400 font-normal'>Ensure permissions are granted or use mouse mode.</span>";
+                loadingStatus.classList.remove('text-amber-400', 'animate-pulse');
+                loadingStatus.classList.add('text-rose-500');
+                
+                fallbackBtn.classList.remove('hidden');
+            }
+        }
+
+        // Start initialization
+        initSystem();
+
+        function startGame() {
+            overlay.classList.add('hidden');
+            resetGame();
+            gameState = 'PLAYING';
+            requestAnimationFrame(gameLoop);
+        }
+
+        startBtn.addEventListener('click', startGame);
+
+        fallbackBtn.addEventListener('click', () => {
+            useMouseFallback = true;
+            videoElement.classList.add('hidden'); // Hide video for mouse mode
+            resizeCanvas();
+            startGame();
+        });
+
+        // Mouse/Touch Fallback Tracking
+        function updateMousePos(e) {
+            if (!useMouseFallback || gameState !== 'PLAYING') return;
+            if (e.type === 'touchmove') e.preventDefault(); // Prevent scrolling
+            
+            let clientX, clientY;
+            if (e.touches && e.touches.length > 0) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+
+            const rect = canvas.getBoundingClientRect();
+            let rawX = clientX - rect.left;
+            let rawY = clientY - rect.top;
+            
+            lastFingerPos = fingerPos;
+            // The canvas is flipped via CSS (-scale-x-100).
+            // So we must invert the mouse X coordinate to draw in the correct visual spot.
+            fingerPos = { x: width - rawX, y: rawY };
+
+            bladeTrail.push(fingerPos);
+            if (bladeTrail.length > MAX_TRAIL_LENGTH) {
+                bladeTrail.shift();
+            }
+        }
+
+        window.addEventListener('mousemove', updateMousePos);
+        window.addEventListener('touchmove', updateMousePos, {passive: false});
+        
+        const clearTrail = () => {
+            if (useMouseFallback) {
+                fingerPos = null;
+                bladeTrail = [];
+            }
+        };
+        window.addEventListener('mouseout', clearTrail);
+        window.addEventListener('touchend', clearTrail);
+        window.addEventListener('mouseup', clearTrail);
+
+        function resetGame() {
+            score = 0;
+            lives = 5;
+            fruits = [];
+            particles = [];
+            bladeTrail = [];
+            scoreVal.innerText = score;
+            livesVal.innerText = "❤️ ❤️ ❤️ ❤️ ❤️";
+        }
+
+        function triggerGameOver() {
+            gameState = 'GAMEOVER';
+            overlay.classList.remove('hidden');
+            loadingStatus.innerHTML = `Game Over!<br>Final Score: <span class="text-amber-400">${score}</span>`;
+            loadingStatus.classList.remove('animate-pulse');
+            
+            if (useMouseFallback) {
+                fallbackBtn.innerText = "PLAY AGAIN";
+                fallbackBtn.classList.remove('hidden');
+                startBtn.classList.add('hidden');
+            } else {
+                startBtn.innerText = "PLAY AGAIN";
+                startBtn.disabled = false;
+                startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        }
+
+        // Main Game Engine Loop
+        function gameLoop() {
+            if (gameState !== 'PLAYING') return;
+
+            // Clear screen fully (allows video background to show through in camera mode)
+            ctx.clearRect(0, 0, width, height);
+
+            const bounds = getVisibleBounds();
+
+            // Spawn Control
+            spawnTimer++;
+            if (spawnTimer > Math.max(25, 80 - Math.floor(score / 50) * 10)) {
+                let count = Math.random() < 0.3 ? 2 : 1;
+                for (let i = 0; i < count; i++) {
+                    fruits.push(new FruitObject());
+                }
+                spawnTimer = 0;
+            }
+
+            // Update & Draw Fruits
+            for (let i = fruits.length - 1; i >= 0; i--) {
+                let f = fruits[i];
+                f.update();
+                f.draw();
+
+                // Collision Detection with Index Finger
+                if (fingerPos && !f.sliced) {
+                    let dist = Math.hypot(fingerPos.x - f.x, fingerPos.y - f.y);
+                    if (dist < f.radius + 40) {
+                        f.sliced = true;
+                        if (f.type.isBomb) {
+                            lives = 0;
+                            livesVal.innerText = "💔";
+                            triggerGameOver();
+                            return;
+                        } else {
+                            score += f.type.points;
+                            scoreVal.innerText = score;
+                            // Create Juice Particles
+                            for (let p = 0; p < 15; p++) {
+                                particles.push(new Particle(f.x, f.y, f.type.color));
+                            }
+                        }
+                    }
+                }
+
+                // Check missed fruits (fell off visible screen without being cut)
+                if (f.y > bounds.maxY + 120 && !f.sliced && !f.type.isBomb) {
+                    lives--;
+                    let hearts = "";
+                    for (let h = 0; h < lives; h++) hearts += "❤️ ";
+                    livesVal.innerText = hearts || "💔";
+                    if (lives <= 0) {
+                        triggerGameOver();
+                        return;
+                    }
+                    f.sliced = true; // Mark as done so we don't deduct again
+                }
+
+                // Remove out of bounds fruits safely
+                if (f.y > bounds.maxY + 150 || f.x < bounds.minX - 100 || f.x > bounds.maxX + 100 || f.sliced) {
+                    fruits.splice(i, 1);
+                }
+            }
+
+            // Update & Draw Particles
+            for (let i = particles.length - 1; i >= 0; i--) {
+                let pt = particles[i];
+                pt.update();
+                pt.draw();
+                if (pt.alpha <= 0) {
+                    particles.splice(i, 1);
+                }
+            }
+
+            // Draw Real Sword and Slash Trail
+            if (bladeTrail.length > 1) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(bladeTrail[0].x, bladeTrail[0].y);
+                for (let i = 1; i < bladeTrail.length; i++) {
+                    ctx.lineTo(bladeTrail[i].x, bladeTrail[i].y);
+                }
+                
+                // Steel slash trail
+                ctx.strokeStyle = 'rgba(200, 210, 220, 0.6)';
+                ctx.lineWidth = 14;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.shadowColor = '#ffffff';
+                ctx.shadowBlur = 12;
+                ctx.stroke();
+                
+                // Inner bright slash core
+                ctx.beginPath();
+                ctx.moveTo(bladeTrail[0].x, bladeTrail[0].y);
+                for (let i = 1; i < bladeTrail.length; i++) {
+                    ctx.lineTo(bladeTrail[i].x, bladeTrail[i].y);
+                }
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 4;
+                ctx.shadowBlur = 0;
+                ctx.stroke();
+                
+                ctx.restore();
+            }
+
+            // Draw the Katana Sword Graphic on the Finger
+            if (fingerPos) {
+                if (lastFingerPos) {
+                    let dx = fingerPos.x - lastFingerPos.x;
+                    let dy = fingerPos.y - lastFingerPos.y;
+                    // Only update rotation angle if moving fast enough to prevent jitter
+                    if (Math.hypot(dx, dy) > 3) {
+                        swordAngle = Math.atan2(dy, dx);
+                    }
+                }
+
+                ctx.save();
+                ctx.translate(fingerPos.x, fingerPos.y);
+                // Rotate the sword to follow the slicing movement direction
+                ctx.rotate(swordAngle);
+                
+                // Blade Drop Shadow
+                ctx.fillStyle = 'rgba(0,0,0,0.4)';
+                ctx.beginPath();
+                ctx.moveTo(-40, 5);
+                ctx.lineTo(60, 5);
+                ctx.lineTo(75, 10);
+                ctx.lineTo(-40, 10);
+                ctx.fill();
+
+                // Main Steel Blade
+                ctx.fillStyle = '#cbd5e1'; 
+                ctx.beginPath();
+                ctx.moveTo(-40, -4); // Base top
+                ctx.lineTo(60, -4);  // Tip top start
+                ctx.lineTo(90, 0);   // Tip point
+                ctx.lineTo(60, 4);   // Tip bottom start
+                ctx.lineTo(-40, 4);  // Base bottom
+                ctx.closePath();
+                ctx.fill();
+                
+                // Blade Edge Highlight (Shiny White)
+                ctx.fillStyle = '#f8fafc';
+                ctx.beginPath();
+                ctx.moveTo(-40, 0);
+                ctx.lineTo(60, 0);
+                ctx.lineTo(90, 0);
+                ctx.lineTo(60, -4);
+                ctx.lineTo(-40, -4);
+                ctx.closePath();
+                ctx.fill();
+
+                // Blood groove (Fuller)
+                ctx.fillStyle = '#94a3b8';
+                ctx.fillRect(-35, -1, 80, 1);
+
+                // Crossguard (Brass/Gold)
+                ctx.fillStyle = '#d97706';
+                ctx.fillRect(-45, -12, 8, 24);
+                // Crossguard Highlight
+                ctx.fillStyle = '#fbbf24';
+                ctx.fillRect(-43, -10, 2, 20);
+
+                // Handle (Dark Leather wrapped)
+                ctx.fillStyle = '#1e293b';
+                ctx.fillRect(-85, -5, 40, 10);
+                
+                // Handle wraps texture
+                ctx.strokeStyle = '#334155';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                for(let w = -80; w < -45; w += 8) {
+                    ctx.moveTo(w, -5);
+                    ctx.lineTo(w + 5, 5);
+                }
+                ctx.stroke();
+
+                // Pommel (Base of handle)
+                ctx.fillStyle = '#d97706';
+                ctx.beginPath();
+                ctx.arc(-85, 0, 6, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = '#fbbf24';
+                ctx.beginPath();
+                ctx.arc(-86, -2, 2, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.restore();
+            }
+
+            requestAnimationFrame(gameLoop);
+        }
+    </script>
+</body>
+</html>
